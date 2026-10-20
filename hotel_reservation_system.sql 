@@ -1,0 +1,312 @@
+CREATE DATABASE IF NOT EXISTS hotel_reservation_db
+    CHARACTER SET utf8mb4
+    COLLATE utf8mb4_unicode_ci;
+
+USE hotel_reservation_db;
+
+SET FOREIGN_KEY_CHECKS = 0;
+
+DROP VIEW IF EXISTS upcoming_reservations;
+DROP VIEW IF EXISTS room_status;
+DROP PROCEDURE IF EXISTS create_reservation;
+DROP PROCEDURE IF EXISTS cancel_reservation;
+DROP TABLE IF EXISTS reservations;
+DROP TABLE IF EXISTS guests;
+DROP TABLE IF EXISTS rooms;
+
+SET FOREIGN_KEY_CHECKS = 1;
+
+CREATE TABLE rooms (
+    room_id INT AUTO_INCREMENT PRIMARY KEY,
+    room_number VARCHAR(10) NOT NULL UNIQUE,
+    room_type VARCHAR(50) NOT NULL,
+    nightly_rate DECIMAL(10, 2) NOT NULL,
+    capacity INT NOT NULL,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    CONSTRAINT chk_room_rate CHECK (nightly_rate >= 0),
+    CONSTRAINT chk_room_capacity CHECK (capacity > 0)
+);
+
+CREATE TABLE guests (
+    guest_id INT AUTO_INCREMENT PRIMARY KEY,
+    full_name VARCHAR(150) NOT NULL,
+    email VARCHAR(150) NOT NULL UNIQUE,
+    phone VARCHAR(30),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE reservations (
+    reservation_id INT AUTO_INCREMENT PRIMARY KEY,
+    room_id INT NOT NULL,
+    guest_id INT NOT NULL,
+    check_in DATE NOT NULL,
+    check_out DATE NOT NULL,
+    guests_count INT NOT NULL,
+    status ENUM('confirmed', 'cancelled', 'completed') NOT NULL DEFAULT 'confirmed',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT chk_reservation_dates CHECK (check_out > check_in),
+    CONSTRAINT chk_reservation_guests CHECK (guests_count > 0),
+    CONSTRAINT fk_reservations_room
+        FOREIGN KEY (room_id) REFERENCES rooms(room_id)
+        ON UPDATE CASCADE
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_reservations_guest
+        FOREIGN KEY (guest_id) REFERENCES guests(guest_id)
+        ON UPDATE CASCADE
+        ON DELETE RESTRICT
+);
+
+ALTER TABLE reservations
+    ADD COLUMN special_requests VARCHAR(500) NULL;
+
+INSERT INTO rooms (room_number, room_type, nightly_rate, capacity) VALUES
+('101', 'Single', 80.00, 1),
+('102', 'Double', 120.00, 2),
+('201', 'Suite', 250.00, 4),
+('202', 'Family', 180.00, 5);
+
+INSERT INTO guests (full_name, email, phone) VALUES
+('Maya Hassan', 'maya@example.com', '0501112233'),
+('Omar Khaled', 'omar@example.com', '0502223344'),
+('Lina Saleh', 'lina@example.com', '0503334455');
+
+INSERT INTO reservations (
+    room_id,
+    guest_id,
+    check_in,
+    check_out,
+    guests_count,
+    status,
+    special_requests
+) VALUES
+(
+    1,
+    1,
+    DATE_ADD(CURRENT_DATE, INTERVAL 2 DAY),
+    DATE_ADD(CURRENT_DATE, INTERVAL 5 DAY),
+    1,
+    'confirmed',
+    'Late check-in'
+),
+(
+    2,
+    2,
+    DATE_SUB(CURRENT_DATE, INTERVAL 10 DAY),
+    DATE_SUB(CURRENT_DATE, INTERVAL 7 DAY),
+    2,
+    'completed',
+    NULL
+);
+
+SELECT
+    r.reservation_id,
+    g.full_name AS guest_name,
+    rm.room_number,
+    rm.room_type,
+    r.check_in,
+    r.check_out,
+    r.status
+FROM reservations AS r
+INNER JOIN guests AS g ON g.guest_id = r.guest_id
+INNER JOIN rooms AS rm ON rm.room_id = r.room_id
+ORDER BY r.check_in;
+
+SELECT
+    room_type,
+    COUNT(*) AS room_count,
+    AVG(nightly_rate) AS average_nightly_rate
+FROM rooms
+WHERE is_active = TRUE
+GROUP BY room_type
+ORDER BY average_nightly_rate DESC;
+
+SELECT
+    g.full_name,
+    COUNT(r.reservation_id) AS reservation_count
+FROM guests AS g
+LEFT JOIN reservations AS r ON r.guest_id = g.guest_id
+GROUP BY g.guest_id, g.full_name
+ORDER BY reservation_count DESC;
+
+SELECT
+    rm.room_number,
+    rm.room_type,
+    rm.nightly_rate
+FROM rooms AS rm
+WHERE rm.is_active = TRUE
+  AND rm.capacity >= 2
+  AND NOT EXISTS (
+      SELECT 1
+      FROM reservations AS r
+      WHERE r.room_id = rm.room_id
+        AND r.status = 'confirmed'
+        AND r.check_in < DATE_ADD(CURRENT_DATE, INTERVAL 7 DAY)
+        AND r.check_out > CURRENT_DATE
+  )
+ORDER BY rm.nightly_rate;
+
+DELIMITER $$
+
+CREATE PROCEDURE create_reservation(
+    IN p_room_id INT,
+    IN p_guest_id INT,
+    IN p_check_in DATE,
+    IN p_check_out DATE,
+    IN p_guests_count INT,
+    IN p_special_requests VARCHAR(500)
+)
+BEGIN
+    DECLARE v_capacity INT DEFAULT NULL;
+    DECLARE v_active BOOLEAN DEFAULT FALSE;
+    DECLARE v_conflict_count INT DEFAULT 0;
+
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        RESIGNAL;
+    END;
+
+    IF p_check_out <= p_check_in THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Check-out date must be after check-in date';
+    END IF;
+
+    IF p_guests_count < 1 THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Guest count must be at least one';
+    END IF;
+
+    START TRANSACTION;
+
+    SELECT capacity, is_active
+    INTO v_capacity, v_active
+    FROM rooms
+    WHERE room_id = p_room_id
+    FOR UPDATE;
+
+    IF v_capacity IS NULL THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Room not found';
+    ELSEIF v_active = FALSE THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Room is not active';
+    ELSEIF p_guests_count > v_capacity THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Guest count exceeds room capacity';
+    ELSEIF NOT EXISTS (
+        SELECT 1
+        FROM guests
+        WHERE guest_id = p_guest_id
+    ) THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Guest not found';
+    END IF;
+
+    SELECT COUNT(*)
+    INTO v_conflict_count
+    FROM reservations
+    WHERE room_id = p_room_id
+      AND status = 'confirmed'
+      AND p_check_in < check_out
+      AND p_check_out > check_in;
+
+    IF v_conflict_count > 0 THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Room is already reserved for these dates';
+    END IF;
+
+    INSERT INTO reservations (
+        room_id,
+        guest_id,
+        check_in,
+        check_out,
+        guests_count,
+        special_requests
+    )
+    VALUES (
+        p_room_id,
+        p_guest_id,
+        p_check_in,
+        p_check_out,
+        p_guests_count,
+        p_special_requests
+    );
+
+    COMMIT;
+END$$
+
+CREATE PROCEDURE cancel_reservation(IN p_reservation_id INT)
+BEGIN
+    DECLARE v_status VARCHAR(20) DEFAULT NULL;
+
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        RESIGNAL;
+    END;
+
+    START TRANSACTION;
+
+    SELECT status
+    INTO v_status
+    FROM reservations
+    WHERE reservation_id = p_reservation_id
+    FOR UPDATE;
+
+    IF v_status IS NULL THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Reservation not found';
+    ELSEIF v_status <> 'confirmed' THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Only confirmed reservations can be cancelled';
+    ELSE
+        UPDATE reservations
+        SET status = 'cancelled'
+        WHERE reservation_id = p_reservation_id;
+
+        COMMIT;
+    END IF;
+END$$
+
+DELIMITER ;
+
+CREATE VIEW upcoming_reservations AS
+SELECT
+    r.reservation_id,
+    g.full_name AS guest_name,
+    g.email,
+    rm.room_number,
+    rm.room_type,
+    r.check_in,
+    r.check_out,
+    r.guests_count,
+    r.status
+FROM reservations AS r
+INNER JOIN guests AS g ON g.guest_id = r.guest_id
+INNER JOIN rooms AS rm ON rm.room_id = r.room_id
+WHERE r.status = 'confirmed'
+  AND r.check_in >= CURRENT_DATE;
+
+CREATE VIEW room_status AS
+SELECT
+    rm.room_id,
+    rm.room_number,
+    rm.room_type,
+    rm.nightly_rate,
+    rm.capacity,
+    CASE
+        WHEN rm.is_active = FALSE THEN 'inactive'
+        WHEN EXISTS (
+            SELECT 1
+            FROM reservations AS r
+            WHERE r.room_id = rm.room_id
+              AND r.status = 'confirmed'
+              AND CURRENT_DATE >= r.check_in
+              AND CURRENT_DATE < r.check_out
+        ) THEN 'occupied'
+        ELSE 'available'
+    END AS current_status
+FROM rooms AS rm;
+
+SELECT * FROM upcoming_reservations;
+SELECT * FROM room_status;
